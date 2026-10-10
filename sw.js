@@ -1,4 +1,4 @@
-const CACHE="nes-logbook-v2";
+const CACHE="nes-logbook-v3";
 const ASSETS=["./","index.html","manifest.webmanifest","icon-192.png","icon-512.png","icon-180.png","favicon-32.png"];
 self.addEventListener("install",e=>{self.skipWaiting();e.waitUntil(caches.open(CACHE).then(c=>Promise.all(ASSETS.map(u=>c.add(u).catch(()=>null)))));});
 self.addEventListener("activate",e=>{e.waitUntil(caches.keys().then(ks=>Promise.all(ks.filter(k=>k!==CACHE).map(k=>caches.delete(k)))).then(()=>self.clients.claim()));});

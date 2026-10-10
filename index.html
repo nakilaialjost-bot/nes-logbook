@@ -309,13 +309,13 @@ function flush(){ if(MODE!=="cloud"||!DBc)return; const keys=Object.keys(pending
 function setSync(state){ const c=$("#syncChip"), t=$("#syncTxt"); if(!c)return; c.className="syncchip "+state;
   const n=Object.keys(pending).length;
   t.textContent = state==="local"?"Local only": state==="syncing"?"Syncing…": state==="offline"?("Offline"+(n?" · "+n:"")): "Synced"; }
-A_syncInfo=()=>{ const body = MODE==="cloud"
+function A_syncInfo(){ const body = MODE==="cloud"
   ? `<p><b>Cloud sync is on.</b> This app is linked to your Claude account, so the same data appears on every device where you open this app — your phone and your computer stay in step automatically whenever they’re online.</p>
      <p class="small muted">Capture on the phone, and it shows up on the computer within seconds. With no signal, your entries are saved on the device and sync the moment you’re back online.</p>
      <p class="small"><b>Open on your computer:</b> sign in to Claude on the computer and open this same app — it loads the same live data.</p>`
   : `<p><b>Local only.</b> This copy stores data on this device and does not sync. It’s the offline/field copy.</p>
      <p class="small muted">To sync your phone and computer automatically, open the app from Claude (the shared link) on both devices.</p>`;
-  openModal("Device sync", body, ()=>{closeModal();}, "Got it"); };
+  openModal("Device sync", body, ()=>{closeModal();}, "Got it"); }
 
 /* ---------- lookups ---------- */
 const project = id => S.projects.find(p=>p.id===id);
@@ -445,7 +445,6 @@ function selField(label,name,val,opts){ return `<div class="field"><label>${esc(
 function aiBtn(action,label,id){ return AI?`<button class="btn btn-sm btn-ghost" data-action="${action}"${id?` data-id="${esc(id)}"`:""} style="margin:-4px 0 10px;color:var(--blue);border-color:var(--blue-soft)">✨ ${esc(label)}</button>`:""; }
 
 /* ============================= ACTIONS ============================= */
-let A_syncInfo;
 const A={};
 A["tab"]=(el)=>{ ui.tab=el.dataset.tab; if(ui.tab!=="log")ui.dayId=null; render(); };
 A["sync-info"]=()=>A_syncInfo();
@@ -812,6 +811,6 @@ boot().catch(function(e){
 });
 })();
 </script>
-<script>if('serviceWorker' in navigator){window.addEventListener('load',function(){navigator.serviceWorker.register('sw.js').then(function(r){r.addEventListener&&r.addEventListener('updatefound',function(){});}).catch(function(){});});}</script>
+<script>if('serviceWorker' in navigator){window.addEventListener('load',function(){navigator.serviceWorker.register('sw.js').catch(function(){});});}</script>
 </body>
 </html>
