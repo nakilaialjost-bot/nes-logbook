@@ -214,6 +214,7 @@ const esc = s => (s==null?"":String(s)).replace(/[&<>"']/g,c=>({"&":"&amp;","<":
 const uid = () => Date.now().toString(36)+Math.random().toString(36).slice(2,7);
 const clean = o => JSON.parse(JSON.stringify(o));
 const todayISO = () => new Date().toISOString().slice(0,10);
+function withTimeout(p,ms){ return Promise.race([Promise.resolve(p),new Promise((_,rej)=>setTimeout(()=>rej(new Error("timeout")),ms))]); }
 function fmtDate(iso){ if(!iso) return "—"; const d=new Date(iso+"T00:00:00"); if(isNaN(d)) return iso;
   return d.toLocaleDateString("en-GB",{weekday:"short",day:"2-digit",month:"short",year:"numeric"}); }
 function parseHM(s){ if(!/^\d{1,2}:\d{2}$/.test(s||"")) return null; const [h,m]=s.split(":").map(Number); if(h>24||m>59) return null; return h*60+m; }
@@ -780,23 +781,37 @@ function startSubscriptions(){
 /* ---------- boot ---------- */
 async function hydratePhotos(){ try{ const all=await IDB.allPhotos(); Object.keys(all).forEach(k=>{ if(!photoURLs[k]) photoURLs[k]=URL.createObjectURL(all[k]); }); }catch(e){} }
 async function boot(){
-  try{ await IDB.open(); }catch(e){ memCache=true; }
-  if(!memCache){ try{ S=await IDB.get("kv","state"); }catch(e){} }
+  // 1) Local cache — never let a stalled IndexedDB freeze startup.
+  try{ await withTimeout(IDB.open(),2000); }catch(e){ memCache=true; IDB._db=null; }
+  if(!memCache){ try{ S=await withTimeout(IDB.get("kv","state"),2000); }catch(e){ S=null; } }
+  // 2) Claude capabilities — only present inside claude.ai; each call time-boxed.
   const C=window.claude;
-  if(C&&typeof C.use==="function"){ try{ DBc=await C.use("db"); }catch(e){ DBc=null; } try{ USERc=await C.use("user"); }catch(e){} try{ ASSETSc=await C.use("assets"); }catch(e){} try{ DLc=await C.use("downloads"); }catch(e){} try{ SAMPLEc=await C.use("sample"); AI=!!SAMPLEc; }catch(e){} }
+  if(C&&typeof C.use==="function"){
+    try{ DBc=await withTimeout(C.use("db"),8000); }catch(e){ DBc=null; }
+    try{ USERc=await withTimeout(C.use("user"),8000); }catch(e){}
+    try{ ASSETSc=await withTimeout(C.use("assets"),8000); }catch(e){}
+    try{ DLc=await withTimeout(C.use("downloads"),8000); }catch(e){}
+    try{ SAMPLEc=await withTimeout(C.use("sample"),8000); AI=!!SAMPLEc; }catch(e){}
+  }
   if(DBc) MODE="cloud";
-  if(!S){ if(MODE==="cloud") S=emptyState(); else { S=seed(); } }
+  // 3) Always have state, and ALWAYS render the UI.
+  if(!S){ S = (MODE==="cloud") ? emptyState() : seed(); }
   ensureDefaults(S);
-  if(MODE!=="cloud") mirrorLocal();
-  await hydratePhotos();
+  if(MODE!=="cloud" && !memCache) mirrorLocal();
   setSync(MODE==="cloud"?"syncing":"local");
   render();
-  if(MODE==="cloud"){ startSubscriptions(); window.addEventListener("online",flush); setInterval(()=>{ if(Object.keys(pending).length)flush(); },15000); }
-  else if(memCache){ const b=document.createElement("div"); b.className="note warnnote"; b.textContent="This browser is blocking local storage, so data won’t persist here. Open the app from Claude to sync, or export a backup before closing."; app.prepend(b); }
+  // 4) Background work that must never block first paint.
+  hydratePhotos().catch(()=>{});
+  if(MODE==="cloud"){ try{ startSubscriptions(); }catch(e){} window.addEventListener("online",flush); setInterval(()=>{ if(Object.keys(pending).length)flush(); },15000); }
+  else if(memCache){ const b=document.createElement("div"); b.className="note warnnote"; b.textContent="This device is blocking local storage, so saved work won’t persist after you close the app. Export a backup to be safe."; app.prepend(b); }
 }
-boot();
+boot().catch(function(e){
+  // Last-resort: guarantee a usable app even if boot throws.
+  try{ if(!S){ S=seed(); ensureDefaults(S); } MODE="local"; setSync("local"); render(); }catch(_){
+    document.getElementById("app").innerHTML='<div style="padding:24px;text-align:center"><p style="font-weight:600">Couldn’t start the app.</p><p class="muted small">Close it fully and reopen. If it keeps happening, reinstall from the link.</p></div>'; }
+});
 })();
 </script>
-<script>if('serviceWorker' in navigator){window.addEventListener('load',function(){navigator.serviceWorker.register('sw.js').catch(function(){});});}</script>
+<script>if('serviceWorker' in navigator){window.addEventListener('load',function(){navigator.serviceWorker.register('sw.js').then(function(r){r.addEventListener&&r.addEventListener('updatefound',function(){});}).catch(function(){});});}</script>
 </body>
 </html>
