@@ -12,6 +12,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="NES Logbook">
+  <script src="supabase-lib.js"></script>
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -200,7 +201,7 @@ h2.title{font-size:20px;font-weight:700;margin:2px 0 3px;letter-spacing:-.2px;te
   <div class="ls" id="lsBody"></div>
 </div>
 
-<input type="file" id="photoInput" accept="image/*" capture="environment" multiple hidden>
+<input type="file" id="photoInput" accept="image/*" multiple hidden>
 <input type="file" id="importInput" accept="application/json,.json" hidden>
 <input type="file" id="projImport" accept="application/json,.json" hidden>
 
@@ -241,6 +242,13 @@ IDB.allPhotos=function(){ return new Promise(res=>{ const out={}; try{ const c=I
 let S=null, memCache=false;
 let MODE="local"; // "local" | "cloud"
 let DBc=null, USERc=null, ASSETSc=null, DLc=null, SAMPLEc=null, AI=false;
+/* Supabase self-hosted sync (used by the installed/offline app, not the claude.ai version) */
+const SUPA_URL="https://rrvtkqjfzlcujsuhyrvq.supabase.co";
+const SUPA_KEY="sb_publishable_OcWCbaEl0CZ8825W3l7GCQ_9u_lEIn_";
+let SB=null, SBch=null, WS="", supaAvailable=false;
+function lsGet(k){ try{ return localStorage.getItem(k); }catch(e){ return null; } }
+function lsSet(k,v){ try{ localStorage.setItem(k,v); }catch(e){} }
+function lsDel(k){ try{ localStorage.removeItem(k); }catch(e){} }
 let subs=[], pending={}, wTimers={};
 const photoURLs={};
 const ui={tab:"projects", projectId:null, dayId:null};
@@ -285,11 +293,64 @@ function dayDoc(d){ return {projectId:d.projectId,date:d.date||"",weather:d.weat
 function projDoc(p){ const o={}; Object.keys(p).forEach(k=>{ if(k!=="id")o[k]=p[k]; }); return o; }
 
 function mirrorLocal(){ if(IDB._db && !memCache){ IDB.set("kv","state",clean(S)).catch(()=>{}); } }
-function saveLib(){ mirrorLocal(); if(MODE==="cloud") cloudSet("meta/library"); }
-function saveProject(p){ mirrorLocal(); if(MODE==="cloud") cloudSet("projects/"+p.id); }
-function delProjectDoc(id){ mirrorLocal(); if(MODE==="cloud") cloudDel("projects/"+id); }
-function saveDay(d){ if(!d)return; mirrorLocal(); if(MODE==="cloud") cloudSet("days/"+d.id); }
-function delDayDoc(id){ mirrorLocal(); if(MODE==="cloud") cloudDel("days/"+id); }
+function saveLib(){ mirrorLocal(); if(MODE==="cloud") cloudSet("meta/library"); else if(MODE==="supa") supaSet("library/main"); }
+function saveProject(p){ mirrorLocal(); if(MODE==="cloud") cloudSet("projects/"+p.id); else if(MODE==="supa") supaSet("project/"+p.id); }
+function delProjectDoc(id){ mirrorLocal(); if(MODE==="cloud") cloudDel("projects/"+id); else if(MODE==="supa") supaDel("project/"+id); }
+function saveDay(d){ if(!d)return; mirrorLocal(); if(MODE==="cloud") cloudSet("days/"+d.id); else if(MODE==="supa") supaSet("day/"+d.id); }
+function delDayDoc(id){ mirrorLocal(); if(MODE==="cloud") cloudDel("days/"+id); else if(MODE==="supa") supaDel("day/"+id); }
+
+/* ---------- Supabase sync layer ---------- */
+function supaRebuild(key){ const sl=key.indexOf("/"); const kind=key.slice(0,sl), id=key.slice(sl+1);
+  if(kind==="library") return {workspace:WS,kind:"library",doc_id:"main",data:libraryDoc()};
+  if(kind==="project"){ const p=S.projects.find(x=>x.id===id); return p?{workspace:WS,kind:"project",doc_id:id,data:projDoc(p)}:null; }
+  if(kind==="day"){ const d=S.days.find(x=>x.id===id); return d?{workspace:WS,kind:"day",doc_id:id,data:dayDoc(d)}:null; }
+  return null; }
+function supaSet(key){ if(MODE!=="supa"||!SB)return; pending[key]="set"; setSync("syncing"); clearTimeout(wTimers[key]);
+  wTimers[key]=setTimeout(async()=>{ const row=supaRebuild(key); if(!row){ delete pending[key]; return afterWrite(); }
+    try{ const {error}=await SB.from("logbook").upsert(row,{onConflict:"workspace,kind,doc_id"}); if(error)throw error; if(pending[key]==="set")delete pending[key]; afterWrite(); }
+    catch(e){ console.warn("supa upsert",e&&e.message); setSync("offline"); } },400); }
+function supaDel(key){ if(MODE!=="supa"||!SB)return; const sl=key.indexOf("/"); const kind=key.slice(0,sl), id=key.slice(sl+1);
+  pending[key]="del"; setSync("syncing"); clearTimeout(wTimers[key]);
+  wTimers[key]=setTimeout(async()=>{ try{ const {error}=await SB.from("logbook").delete().eq("workspace",WS).eq("kind",kind).eq("doc_id",id); if(error)throw error; if(pending[key]==="del")delete pending[key]; afterWrite(); }
+    catch(e){ console.warn("supa delete",e&&e.message); setSync("offline"); } },300); }
+function flushSupa(){ if(MODE!=="supa"||!SB)return; const keys=Object.keys(pending); if(!keys.length){ afterWrite(); return; } setSync("syncing");
+  keys.forEach(async key=>{ const op=pending[key];
+    try{ if(op==="del"){ const sl=key.indexOf("/"); await SB.from("logbook").delete().eq("workspace",WS).eq("kind",key.slice(0,sl)).eq("doc_id",key.slice(sl+1)); }
+      else { const row=supaRebuild(key); if(row) await SB.from("logbook").upsert(row,{onConflict:"workspace,kind,doc_id"}); }
+      delete pending[key]; afterWrite(); }catch(e){} }); }
+function applyCloudRows(rows){ S.projects=[]; S.days=[];
+  rows.forEach(r=>{ const d=r.data||{};
+    if(r.kind==="library") applyLibrary(d);
+    else if(r.kind==="project") S.projects.push(Object.assign({id:r.doc_id},d));
+    else if(r.kind==="day") S.days.push(Object.assign({id:r.doc_id},d)); });
+  ensureDefaults(S); }
+async function pushAllToCloud(){ const rows=[{workspace:WS,kind:"library",doc_id:"main",data:libraryDoc()}];
+  S.projects.forEach(p=>rows.push({workspace:WS,kind:"project",doc_id:p.id,data:projDoc(p)}));
+  S.days.forEach(d=>rows.push({workspace:WS,kind:"day",doc_id:d.id,data:dayDoc(d)}));
+  try{ await SB.from("logbook").upsert(rows,{onConflict:"workspace,kind,doc_id"}); }catch(e){ console.warn("seed cloud",e&&e.message); } }
+async function supaConnect(){ if(!SB||!WS)return; setSync("syncing");
+  try{ const {data,error}=await SB.from("logbook").select("*").eq("workspace",WS); if(error)throw error;
+    if(data&&data.length){ applyCloudRows(data); } else { await pushAllToCloud(); }
+    mirrorLocal(); syncRender(); subscribeSupa(); setSync(Object.keys(pending).length?"syncing":"synced"); reconcilePhotos(); }
+  catch(e){ console.warn("supa connect",e&&e.message); setSync("offline"); } }
+function subscribeSupa(){ if(!SB)return; if(SBch){ try{ SB.removeChannel(SBch); }catch(e){} SBch=null; }
+  SBch=SB.channel("logbook-"+WS).on("postgres_changes",{event:"*",schema:"public",table:"logbook",filter:"workspace=eq."+WS}, onSupaChange).subscribe(); }
+function onSupaChange(payload){
+  if(payload.eventType==="DELETE"){ const r=payload.old||{}; if(r.kind==="project"){ S.projects=S.projects.filter(p=>p.id!==r.doc_id); S.days=S.days.filter(d=>d.projectId!==r.doc_id); } else if(r.kind==="day"){ S.days=S.days.filter(d=>d.id!==r.doc_id); } }
+  else { const r=payload.new||{}; const d=r.data||{};
+    if(r.kind==="library"){ applyLibrary(d); }
+    else if(r.kind==="project"){ const i=S.projects.findIndex(p=>p.id===r.doc_id); const o=Object.assign({id:r.doc_id},d); if(i>=0)S.projects[i]=o; else S.projects.push(o); }
+    else if(r.kind==="day"){ const i=S.days.findIndex(x=>x.id===r.doc_id); const o=Object.assign({id:r.doc_id},d); if(i>=0)S.days[i]=o; else S.days.push(o); } }
+  mirrorLocal(); syncRender(); }
+async function reconcilePhotos(){ if(MODE!=="supa"||!SB)return;
+  for(const d of S.days){ let changed=false;
+    for(const p of (d.photos||[])){ if(p.data && !p.url && !p.sid){ try{ const blob=dataURLtoBlob(p.data); const path=WS+"/"+uid()+".jpg";
+      const {error}=await SB.storage.from("photos").upload(path,blob,{contentType:"image/jpeg",upsert:true}); if(!error){ const pub=SB.storage.from("photos").getPublicUrl(path); p.sid=path; p.url=(pub&&pub.data&&pub.data.publicUrl)||""; delete p.data; if(p.url)photoURLs[path]=p.url; changed=true; } }catch(e){} } }
+    if(changed) saveDay(d); } }
+async function supaDoConnect(code){ WS=code; lsSet("nes_ws",code);
+  if(!SB && window.supabase){ try{ SB=window.supabase.createClient(SUPA_URL,SUPA_KEY,{auth:{persistSession:false}}); }catch(e){} }
+  if(!SB){ toast("Sync library not loaded — reconnect to the internet and reopen"); return; }
+  MODE="supa"; setSync("syncing"); render(); await supaConnect(); }
 
 function rebuild(path){ if(path==="meta/library")return libraryDoc(); const seg=path.split("/");
   if(seg[0]==="projects"){ const p=S.projects.find(x=>x.id===seg[1]); return p?projDoc(p):null; }
@@ -308,14 +369,28 @@ function flush(){ if(MODE!=="cloud"||!DBc)return; const keys=Object.keys(pending
 /* ---------- sync indicator ---------- */
 function setSync(state){ const c=$("#syncChip"), t=$("#syncTxt"); if(!c)return; c.className="syncchip "+state;
   const n=Object.keys(pending).length;
-  t.textContent = state==="local"?"Local only": state==="syncing"?"Syncing…": state==="offline"?("Offline"+(n?" · "+n:"")): "Synced"; }
-function A_syncInfo(){ const body = MODE==="cloud"
-  ? `<p><b>Cloud sync is on.</b> This app is linked to your Claude account, so the same data appears on every device where you open this app — your phone and your computer stay in step automatically whenever they’re online.</p>
-     <p class="small muted">Capture on the phone, and it shows up on the computer within seconds. With no signal, your entries are saved on the device and sync the moment you’re back online.</p>
-     <p class="small"><b>Open on your computer:</b> sign in to Claude on the computer and open this same app — it loads the same live data.</p>`
-  : `<p><b>Local only.</b> This copy stores data on this device and does not sync. It’s the offline/field copy.</p>
-     <p class="small muted">To sync your phone and computer automatically, open the app from Claude (the shared link) on both devices.</p>`;
-  openModal("Device sync", body, ()=>{closeModal();}, "Got it"); }
+  t.textContent = state==="local"?(supaAvailable?"Tap to sync":"Local only"): state==="syncing"?"Syncing…": state==="offline"?("Offline"+(n?" · "+n:"")): "Synced"; }
+function A_syncInfo(){
+  if(MODE==="cloud"){ openModal("Device sync",
+    `<p><b>Cloud sync is on.</b> This app is linked to your Claude account, so the same data appears on every device where you open it.</p>
+     <p class="small muted">Capture on the phone, and it shows on the computer within seconds. Offline, entries save on the device and sync when you’re back online.</p>`,
+    ()=>{closeModal();}, "Got it"); return; }
+  if(supaAvailable){ const connected=MODE==="supa";
+    const suggest = WS || ("NES-"+Math.random().toString(36).slice(2,8).toUpperCase());
+    const body = connected
+      ? `<p><b>Sync is on.</b> This device shares live data with everyone using the same workspace code.</p>
+         <div class="field"><label>Workspace code</label><input value="${esc(WS)}" readonly onclick="this.select()"></div>
+         <p class="small muted">Enter this exact code on your laptop and your crew’s phones to join the same data. Works offline; syncs when back online.</p>
+         <button class="btn btn-sm btn-danger btn-block" data-action="supa-disconnect" style="margin-top:4px">Turn off sync on this device</button>`
+      : `<p><b>Turn on sync</b> to share live data across your phone, laptop and crew — no sign-in needed.</p>
+         <div class="field"><label>Workspace code</label><input data-m="ws" value="${esc(suggest)}" placeholder="NES-AB12CD" autocapitalize="characters"></div>
+         <p class="small muted">Use the <b>same</b> code on every device that should share data. On your first device keep the suggested code; on the others, type that exact code. Keep it private — anyone with the code can see this data.</p>`;
+    openModal("Device sync", body, ()=>{ if(!connected){ const el=$("#scrim").querySelector('[data-m="ws"]'); const v=(el?el.value:"").trim().toUpperCase().replace(/\s+/g,""); if(!v){toast("Enter a workspace code");return false;} closeModal(); supaDoConnect(v); return; } closeModal(); }, connected?"Done":"Connect sync");
+    return; }
+  openModal("Device sync",
+    `<p><b>Local only.</b> This copy stores data on this device and does not sync.</p>
+     <p class="small muted">Move a project between devices with Export ▸ Share this project / Import.</p>`,
+    ()=>{closeModal();}, "Got it"); }
 
 /* ---------- lookups ---------- */
 const project = id => S.projects.find(p=>p.id===id);
@@ -324,7 +399,7 @@ const daysOf = pid => S.days.filter(d=>d.projectId===pid).sort((a,b)=>(a.date||"
 const dayTotal = d => (d.labour||[]).reduce((s,l)=>s+(netHrs(l.in,l.out,l.brk)||0),0);
 function statusClass(s){ s=(s||"").toLowerCase(); if(s.startsWith("comp"))return"ok"; if(s.startsWith("in"))return"prog"; if(s.startsWith("ong"))return"ong"; return"todo"; }
 const curDay = () => S.days.find(x=>x.id===ui.dayId);
-function pSrc(p){ if(p.aid) return photoURLs[p.aid]||("/_blob/"+p.aid); return photoURLs[p.id]||""; }
+function pSrc(p){ if(p.url) return p.url; if(p.data) return p.data; if(p.sid) return SUPA_URL+"/storage/v1/object/public/photos/"+p.sid; if(p.aid) return photoURLs[p.aid]||("/_blob/"+p.aid); return photoURLs[p.id]||""; }
 
 /* ============================= RENDER ============================= */
 function render(){
@@ -448,6 +523,7 @@ function aiBtn(action,label,id){ return AI?`<button class="btn btn-sm btn-ghost"
 const A={};
 A["tab"]=(el)=>{ ui.tab=el.dataset.tab; if(ui.tab!=="log")ui.dayId=null; render(); };
 A["sync-info"]=()=>A_syncInfo();
+A["supa-disconnect"]=()=>{ lsDel("nes_ws"); if(SBch){ try{ SB.removeChannel(SBch); }catch(e){} SBch=null; } WS=""; MODE="local"; pending={}; closeModal(); setSync("local"); render(); toast("Sync turned off on this device"); };
 
 function projectForm(p){ p=p||{};
   return field("Project / Contract name","name",p.name,"","e.g. Emergency Power Upgrade")+field("Client","client",p.client)
@@ -510,12 +586,25 @@ A["edit-material"]=(el)=>{ const m=curDay().materials.find(x=>x.id===el.dataset.
 A["del-material"]=(el)=>{ const d=curDay(); d.materials=d.materials.filter(x=>x.id!==el.dataset.id); saveDay(d); render(); };
 
 A["add-photo"]=()=>$("#photoInput").click();
-async function handlePhotos(files){ const d=curDay(); if(!d)return; let n=0;
-  for(const f of files){ if(!f.type.startsWith("image/"))continue; try{ const blob=await compress(f);
-    if(MODE==="cloud"&&ASSETSc){ const r=await ASSETSc.upload(blob,{type:"image/jpeg"}); photoURLs[r.id]=r.url; d.photos.push({aid:r.id,title:"",desc:""}); }
-    else { const id=uid(); await IDB.set("photos",id,blob); photoURLs[id]=URL.createObjectURL(blob); d.photos.push({id,title:"",desc:""}); }
-    n++; }catch(e){ console.warn(e); toast("A photo couldn’t be added"); } }
-  if(n){ saveDay(d); render(); toast(n+" photo"+(n>1?"s":"")+" added — tap to caption"); } }
+async function handlePhotos(files){ const d=curDay(); if(!d)return; let n=0, failed=0;
+  for(const f of files){ if(!f || !f.type || f.type.indexOf("image/")!==0) continue;
+    try{
+      let blob; try{ blob=await compress(f); }catch(_){ blob=f; } // if resize fails, keep the original photo
+      // Cloud (claude.ai) — upload as an asset.
+      if(MODE==="cloud"&&ASSETSc){ try{ const r=await ASSETSc.upload(blob,{type:"image/jpeg"}); photoURLs[r.id]=r.url; d.photos.push({aid:r.id,title:"",desc:""}); n++; continue; }catch(_){ } }
+      // Supabase sync — upload to the shared photo store; keep a local inline copy too so it shows instantly.
+      const id=uid();
+      if(MODE==="supa"&&SB){ try{ const path=WS+"/"+id+".jpg"; const up=await SB.storage.from("photos").upload(path,blob,{contentType:"image/jpeg",upsert:true});
+        if(!up.error){ const pub=SB.storage.from("photos").getPublicUrl(path); const url=(pub&&pub.data&&pub.data.publicUrl)||""; if(url){ photoURLs[path]=url; photoURLs[id]=url; d.photos.push({id,sid:path,url,title:"",desc:""}); n++; continue; } } }catch(_){ } }
+      // Local (or offline) — try the on-device database; else keep the image inline so it still shows and exports (and syncs later).
+      let done=false;
+      if(IDB._db && !memCache && MODE!=="supa"){ try{ await IDB.set("photos",id,blob); photoURLs[id]=URL.createObjectURL(blob); d.photos.push({id,title:"",desc:""}); done=true; }catch(_){ } }
+      if(!done){ const durl=await blobToDataURL(blob); photoURLs[id]=durl; d.photos.push({id,data:durl,title:"",desc:""}); done=true; }
+      n++;
+    }catch(e){ console.warn("photo add failed",e); failed++; }
+  }
+  if(n){ saveDay(d); render(); toast(n+" photo"+(n>1?"s":"")+" added — tap to caption"); }
+  else toast(failed?"Couldn’t add that photo — please try again":"No photo selected"); }
 function compress(file){ return new Promise((res,rej)=>{ const img=new Image(); const url=URL.createObjectURL(file);
   img.onload=()=>{ const max=1400; let w=img.width,h=img.height; if(w>h&&w>max){h=h*max/w;w=max;} else if(h>max){w=w*max/h;h=max;}
     const c=document.createElement("canvas"); c.width=w; c.height=h; c.getContext("2d").drawImage(img,0,0,w,h); URL.revokeObjectURL(url);
@@ -526,7 +615,7 @@ A["edit-photo"]=(el)=>{ const key=el.dataset.id; const d=curDay(); const p=d.pho
     <button class="btn btn-sm btn-danger btn-block" data-action="del-photo" data-id="${esc(key)}">Delete photo</button>`,
   ()=>{ p.title=$("#scrim").querySelector('[data-m="title"]').value.trim(); p.desc=$("#scrim").querySelector('[data-m="desc"]').value.trim(); saveDay(curDay()); closeModal(); render(); }); };
 A["del-photo"]=(el)=>{ const key=el.dataset.id; const d=curDay(); const p=d.photos.find(x=>(x.aid||x.id)===key);
-  if(p){ if(p.aid&&ASSETSc)ASSETSc.delete(p.aid).catch(()=>{}); if(p.id)IDB.del("photos",p.id); } d.photos=d.photos.filter(x=>(x.aid||x.id)!==key); saveDay(d); closeModal(); render(); };
+  if(p){ if(p.aid&&ASSETSc)ASSETSc.delete(p.aid).catch(()=>{}); if(p.sid&&SB){ try{ SB.storage.from("photos").remove([p.sid]); }catch(e){} } if(p.id)IDB.del("photos",p.id); } d.photos=d.photos.filter(x=>(x.aid||x.id)!==key); saveDay(d); closeModal(); render(); };
 
 /* ---------- AI assist (online, via the sample capability) ---------- */
 async function getPhotoBlob(p){ try{ if(p.aid){ const r=await fetch("/_blob/"+p.aid); if(r.ok)return await r.blob(); } if(p.id){ return await IDB.get("photos",p.id); } }catch(e){} return null; }
@@ -587,7 +676,7 @@ async function restoreBackup(obj){ if(!obj||!obj.state){toast("Not a valid backu
   ui.projectId=null;ui.dayId=null;ui.tab="projects"; render(); toast("Backup restored"); }
 
 /* ---------- team hand-off: share / import one project (with photos) ---------- */
-async function photoToDataURL(p){ try{ if(p.aid){ const r=await fetch("/_blob/"+p.aid); if(r.ok) return await blobToDataURL(await r.blob()); } if(p.id){ const b=await IDB.get("photos",p.id); if(b) return await blobToDataURL(b); } }catch(e){} return null; }
+async function photoToDataURL(p){ try{ if(p.data) return p.data; if(p.url){ const r=await fetch(p.url); if(r.ok) return await blobToDataURL(await r.blob()); } if(p.aid){ const r=await fetch("/_blob/"+p.aid); if(r.ok) return await blobToDataURL(await r.blob()); } if(p.id){ const b=await IDB.get("photos",p.id); if(b) return await blobToDataURL(b); } }catch(e){} return null; }
 async function exportProjectBundle(){ const ap=activeProject(); if(!ap)return null; const days=daysOf(ap.id).map(d=>clean(d)); const photos={};
   for(const d of days){ for(const p of (d.photos||[])){ const key=p.aid||p.id; if(key&&!photos[key]){ const du=await photoToDataURL(p); if(du)photos[key]=du; } } }
   return {_nes_project:1,at:new Date().toISOString(),project:clean(ap),days,photos}; }
@@ -793,15 +882,22 @@ async function boot(){
     try{ SAMPLEc=await withTimeout(C.use("sample"),8000); AI=!!SAMPLEc; }catch(e){}
   }
   if(DBc) MODE="cloud";
+  // 2b) Supabase sync (installed/offline app). Not used when Claude's own cloud is present.
+  if(!DBc && window.supabase && SUPA_URL && SUPA_KEY){
+    try{ SB=window.supabase.createClient(SUPA_URL,SUPA_KEY,{auth:{persistSession:false}}); supaAvailable=!!SB; }catch(e){ SB=null; supaAvailable=false; }
+    WS=lsGet("nes_ws")||"";
+    if(SB && WS) MODE="supa";
+  }
   // 3) Always have state, and ALWAYS render the UI.
   if(!S){ S = (MODE==="cloud") ? emptyState() : seed(); }
   ensureDefaults(S);
   if(MODE!=="cloud" && !memCache) mirrorLocal();
-  setSync(MODE==="cloud"?"syncing":"local");
+  setSync(MODE==="cloud"?"syncing": MODE==="supa"?"syncing":"local");
   render();
   // 4) Background work that must never block first paint.
   hydratePhotos().catch(()=>{});
   if(MODE==="cloud"){ try{ startSubscriptions(); }catch(e){} window.addEventListener("online",flush); setInterval(()=>{ if(Object.keys(pending).length)flush(); },15000); }
+  else if(MODE==="supa"){ supaConnect(); window.addEventListener("online",()=>{ flushSupa(); reconcilePhotos(); }); setInterval(()=>{ if(Object.keys(pending).length)flushSupa(); },15000); }
   else if(memCache){ const b=document.createElement("div"); b.className="note warnnote"; b.textContent="This device is blocking local storage, so saved work won’t persist after you close the app. Export a backup to be safe."; app.prepend(b); }
 }
 boot().catch(function(e){
